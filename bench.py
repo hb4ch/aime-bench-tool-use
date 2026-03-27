@@ -127,6 +127,8 @@ MAX_TOTAL_TURNS = MAX_TOOL_ROUNDS + 1
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_REASONING_EFFORT = "medium"
 CODE_EXEC_TIMEOUT_SECONDS = 60
+MAX_CONSECUTIVE_TOOL_FAILURES = 2
+STAGNATION_WINDOW = 3
 DEFAULT_WORKER_STALL_TIMEOUT_SECONDS = 120
 JOIN_POLL_INTERVAL_SECONDS = 1.0
 
@@ -197,6 +199,10 @@ def normalize_code_string(code: str) -> str:
 
 def format_code_with_line_numbers(code: str) -> str:
     return "\n".join(f"{i + 1:03d}: {line}" for i, line in enumerate(code.splitlines()))
+
+
+def normalize_whitespace(text: str) -> str:
+    return " ".join(text.split())
 
 
 def normalize_answer_string(text: Optional[str]) -> Optional[str]:
@@ -432,6 +438,92 @@ def try_extract_code_request(
             log_warn(f"{tag} | content_parse_failed | {type(e).__name__}: {e}")
 
     return None
+
+
+def detect_obviously_broken_tool_code(code: str) -> Optional[str]:
+    stripped = code.strip()
+    if not stripped:
+        return "empty code"
+
+    placeholder_patterns = (
+        r"=\s*$",
+        r"\(\s*,",
+        r",\s*,",
+        r"=\s*$",
+    )
+    for pattern in placeholder_patterns:
+        if re.search(pattern, stripped, flags=re.MULTILINE):
+            return "contains an unfinished placeholder"
+
+    for line in stripped.splitlines():
+        if re.search(r"=\s*$", line):
+            return "contains an assignment with no expression"
+
+    try:
+        ast.parse(stripped)
+    except SyntaxError as e:
+        return f"invalid Python syntax: {e}"
+
+    return None
+
+
+def fingerprint_tool_payload(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    normalized = normalize_whitespace(text)
+    if not normalized:
+        return None
+    return normalized[:300]
+
+
+def build_tool_retry_prompt(reason: str) -> str:
+    return (
+        "Your previous tool code was not executed because it was obviously malformed "
+        f"({reason}). Reissue a corrected python_exec call with valid JSON arguments "
+        'like {"code": "print(1+1)"} and complete Python code only.'
+    )
+
+
+def build_finalization_prompt_from_tool_result(tool_output: Optional[str] = None) -> str:
+    if tool_output:
+        return (
+            "You are out of tool budget or should stop using tools.\n"
+            "Use the latest Python result below to finish the problem.\n"
+            "Do not call any more tools.\n"
+            "Give exactly one final boxed answer like \\boxed{123}.\n"
+            f"Latest Python result:\n{tool_output}"
+        )
+    return build_finalization_prompt()
+
+
+def should_force_finalization_early(
+    recent_tool_events: List[Dict[str, Optional[str]]],
+    consecutive_tool_failures: int,
+    remaining_turns_after_current: int,
+) -> bool:
+    if remaining_turns_after_current <= 1 and recent_tool_events:
+        return True
+    if consecutive_tool_failures >= MAX_CONSECUTIVE_TOOL_FAILURES:
+        return True
+    if len(recent_tool_events) < STAGNATION_WINDOW:
+        return False
+
+    window = recent_tool_events[-STAGNATION_WINDOW:]
+    if all(event.get("status") != "ok" for event in window):
+        return True
+
+    code_fingerprints = [event.get("code_fingerprint") for event in window if event.get("code_fingerprint")]
+    if len(code_fingerprints) >= 2 and len(set(code_fingerprints)) == 1:
+        return True
+
+    output_fingerprints = [
+        event.get("output_fingerprint") for event in window
+        if event.get("status") == "ok" and event.get("output_fingerprint")
+    ]
+    if len(output_fingerprints) >= 2 and len(set(output_fingerprints)) == 1:
+        return True
+
+    return False
 
 
 def normalize_code_to_print_last_expression(code_content: str) -> str:
@@ -1085,6 +1177,9 @@ class BenchmarkClient:
         finalization_prompt_sent = False
         repaired_tool_call_count = 0
         forced_finalization_turns = 0
+        consecutive_tool_failures = 0
+        recent_tool_events: List[Dict[str, Optional[str]]] = []
+        last_tool_output: Optional[str] = None
         if sample_scratch_dir is None:
             sample_scratch_dir = Path.cwd()
         sample_scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -1093,7 +1188,15 @@ class BenchmarkClient:
             log_info(f"{tag} | start")
 
         while total_turns < effective_max_total_turns:
-            use_tools = tool_rounds < max_tool_rounds and total_turns < effective_max_total_turns - 1
+            use_tools = (
+                tool_rounds < max_tool_rounds
+                and total_turns < effective_max_total_turns - 1
+                and not should_force_finalization_early(
+                    recent_tool_events,
+                    consecutive_tool_failures,
+                    effective_max_total_turns - total_turns - 1,
+                )
+            )
             forcing_finalization = not use_tools
 
             if self.verbose:
@@ -1103,7 +1206,12 @@ class BenchmarkClient:
                 )
 
             if forcing_finalization and not finalization_prompt_sent and msgs:
-                msgs.append({"role": "user", "content": build_finalization_prompt()})
+                msgs.append(
+                    {
+                        "role": "user",
+                        "content": build_finalization_prompt_from_tool_result(last_tool_output),
+                    }
+                )
                 finalization_prompt_sent = True
                 forced_finalization_turns += 1
                 log_info(f"{tag} | forced_finalization_prompt_sent")
@@ -1198,7 +1306,12 @@ class BenchmarkClient:
             if finish_reason == "tool_calls" and not use_tools:
                 log_warn(f"{tag} | tool_call_requested_during_finalization")
                 msgs.append(build_assistant_message_dict(message))
-                msgs.append({"role": "user", "content": build_finalization_prompt()})
+                msgs.append(
+                    {
+                        "role": "user",
+                        "content": build_finalization_prompt_from_tool_result(last_tool_output),
+                    }
+                )
                 total_turns += 1
                 continue
 
@@ -1238,6 +1351,19 @@ class BenchmarkClient:
                     log_info(f"{tag} | code_after_normalize_repr={code_to_run!r}")
                     log_info(f"{tag} | code_after_normalize_lines=\n{format_code_with_line_numbers(code_to_run)}")
 
+                    broken_code_reason = detect_obviously_broken_tool_code(code_to_run)
+                    if broken_code_reason is not None:
+                        log_warn(f"{tag} | rejected_broken_tool_code | {broken_code_reason}")
+                        msgs.append(build_assistant_message_dict(message))
+                        msgs.append(
+                            {
+                                "role": "user",
+                                "content": build_tool_retry_prompt(broken_code_reason),
+                            }
+                        )
+                        total_turns += 1
+                        continue
+
                     code_str = indent_code_block(code_to_run)
                     log_info(f"{tag} | code_after_indent_repr={code_str!r}")
                     log_info(f"{tag} | tool_intent_detected | executing_code_lines=\n{format_code_with_line_numbers(code_str)}")
@@ -1276,6 +1402,20 @@ class BenchmarkClient:
                     tool_status = "timeout"
                 elif ret.startswith("ToolError:"):
                     tool_status = "error"
+                if tool_status == "ok":
+                    consecutive_tool_failures = 0
+                    last_tool_output = ret
+                else:
+                    consecutive_tool_failures += 1
+                recent_tool_events.append(
+                    {
+                        "status": tool_status,
+                        "code_fingerprint": fingerprint_tool_payload(code_to_run),
+                        "output_fingerprint": fingerprint_tool_payload(ret),
+                    }
+                )
+                if len(recent_tool_events) > STAGNATION_WINDOW:
+                    recent_tool_events = recent_tool_events[-STAGNATION_WINDOW:]
 
                 if tool_calls:
                     first_tool_call = tool_calls[0]
@@ -1290,9 +1430,14 @@ class BenchmarkClient:
                     force_finalize_after_tool = (
                         next_tool_rounds >= max_tool_rounds
                         or next_total_turns >= effective_max_total_turns - 1
+                        or should_force_finalization_early(
+                            recent_tool_events,
+                            consecutive_tool_failures,
+                            effective_max_total_turns - next_total_turns,
+                        )
                     )
                     followup_content = (
-                        build_finalization_prompt()
+                        build_finalization_prompt_from_tool_result(ret)
                         if force_finalize_after_tool
                         else (
                             "Python execution result:\n"
@@ -1332,7 +1477,7 @@ class BenchmarkClient:
                         {
                             "role": "user",
                             "content": (
-                                build_finalization_prompt()
+                                build_finalization_prompt_from_tool_result(ret)
                                 if force_finalize_after_tool
                                 else (
                                     "Python execution result:\n"
